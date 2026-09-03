@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -831,6 +841,102 @@ func TestSelfClosingTagValueConfusion(t *testing.T) {
 	if tok != StartTagToken {
 		t.Fatalf("unexpected token type: got %s, want %s", tok, StartTagToken)
 	}
+}
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+// TestDuplicateAttributeSanitizerConfusion covers the Parse-then-Render round
+// trip: every duplicate attribute used to survive it, so the tree an
+// application saw disagreed with the one a browser builds from the same bytes
+// (a browser keeps only the first value). A sanitizer that folds Node.Attr into
+// a map therefore judged a tag by a value the browser never uses, while Render
+// re-emitted the attacker's first value alongside it.
+func TestDuplicateAttributeSanitizerConfusion(t *testing.T) {
+	tests := []struct {
+		desc string
+		tag  string
+		html string
+		want string
+	}{
+		{
+			"javascript: URL shadowed by a later benign href",
+			"a",
+			`<a href="javascript:alert(1)" href="https://example.com/safe">x</a>`,
+			`<a href="javascript:alert(1)">x</a>`,
+		},
+		{
+			"event handler shadowed by a later empty handler",
+			"img",
+			`<img src="x" onerror="alert(1)" onerror="">`,
+			`<img src="x" onerror="alert(1)"/>`,
+		},
+		{
+			"duplicate differing only in ASCII case",
+			"a",
+			`<a HREF="javascript:alert(1)" href="https://example.com/safe">x</a>`,
+			`<a href="javascript:alert(1)">x</a>`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			doc, err := Parse(strings.NewReader(tt.html))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			n := findElement(doc, tt.tag)
+			if n == nil {
+				t.Fatalf("no <%s> element in the parsed tree", tt.tag)
+			}
+			// A sanitizer reads Node.Attr: each name must appear once, so that
+			// whichever occurrence it inspects is the one the browser honors.
+			seen := map[string]bool{}
+			for _, a := range n.Attr {
+				if seen[a.Key] {
+					t.Errorf("attribute %q appears more than once in %v", a.Key, n.Attr)
+				}
+				seen[a.Key] = true
+			}
+			var buf bytes.Buffer
+			if err := Render(&buf, n); err != nil {
+				t.Fatalf("Render: %v", err)
+			}
+			if got := buf.String(); got != tt.want {
+				t.Errorf("Render round trip: got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// findElement returns the first element node named tag, in document order.
+func findElement(n *Node, tag string) *Node {
+	if n.Type == ElementNode && n.Data == tag {
+		return n
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if found := findElement(c, tag); found != nil {
+			return found
+		}
+	}
+	return nil
 }
 
 // zeroOneByteReader is like a strings.Reader that alternates between
